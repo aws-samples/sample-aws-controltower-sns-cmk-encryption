@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Template to update the SNS topic "aws-controltower-SecurityNotifications" with CMK encryption in child accounts created by ControlTower.'
+Parameters:
+  KMSKeyId:
+    Type: String
+    Description: 'Comma-separated list of KMS Key ARNs for SNS topic encryption (each ARN must be in format arn:aws:kms:region:account-id:key/key-id)'
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStackInstances     
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/AWSControlTowerBP-BASELINE-CONFIG*" 
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/AWSControlTowerExecution"
+
+  SNSKMSUpdateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-SNSKMSUpdateFunction'
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import botocore.exceptions
+          import os
+          import cfnresponse
+          from botocore.config import Config
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def parse_kms_arn(kms_arn):
+              """
+              Parse KMS ARN to extract account ID and region
+              """
+              try:
+                  # Expected format: arn:aws:kms:region:account-id:key/key-id
+                  parts = kms_arn.strip().split(':')
+                  if len(parts) != 6:
+                      raise ValueError(f"Invalid KMS ARN format: {kms_arn}")
+                  
+                  return {
+                      'region': parts[3],
+                      'account_id': parts[4],
+                      'key_id': kms_arn
+                  }
+              except Exception as e:
+                  raise ValueError(f"Failed to parse KMS ARN: {str(e)}")
+
+          def get_unique_accounts(kms_arns):
+              """
+              Extract unique account/region pairs from KMS ARNs
+              """
+              unique_pairs = set()
+              account_details = []
+              
+              for arn in kms_arns:
+                  details = parse_kms_arn(arn)
+                  pair = (details['account_id'], details['region'])
+                  if pair not in unique_pairs:
+                      unique_pairs.add(pair)
+                      account_details.append(details)
+              
+              return account_details
+
+          def check_account_in_stackset(account_id):
+              """
+              Check if the given account ID is in the AAWSControlTowerBP-BASELINE-CONFIG StackSet.
+              """
+              try:
+                  client = boto3.client('cloudformation')
+                  paginator = client.get_paginator('list_stack_instances')
+                  page_iterator = paginator.paginate(StackSetName='AWSControlTowerBP-BASELINE-CONFIG', StackInstanceAccount=account_id)
+                  
+                  for page in page_iterator:
+                      if page['Summaries']:
+                          return True
+                  return False
+              except Exception as e:
+                  logger.error(f"Error checking account in StackSet: {str(e)}")
+                  return False
+
+          def validate_kms_key(session, region, kms_key_id):
+              """
+              Validate if the KMS key exists and is accessible in the target account
+              """
+              try:
+                  kms = session.client('kms', region_name=region)
+                  
+                  # Try to describe the key
+                  response = kms.describe_key(KeyId=kms_key_id)
+                  
+                  # Check if key is enabled
+                  if not response['KeyMetadata']['Enabled']:
+                      raise ValueError(f"KMS key {kms_key_id} is disabled")
+                  
+                  # Check if key is the correct type (SYMMETRIC by default for SNS)
+                  if response['KeyMetadata']['KeySpec'] != 'SYMMETRIC_DEFAULT':
+                      raise ValueError(f"KMS key {kms_key_id} is not a symmetric key")
+                  
+                  return True, kms_key_id
+                  
+              except botocore.exceptions.ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  if error_code == 'NotFoundException':
+                      return False, f"KMS key {kms_key_id} not found in account"
+                  elif error_code == 'AccessDeniedException':
+                      return False, f"No permission to access KMS key {kms_key_id}"
+                  else:
+                      return False, f"Error validating KMS key: {str(e)}"
+              except Exception as e:
+                  return False, f"Unexpected error validating KMS key: {str(e)}"
+
+          def validate_sns_topic(session, region, account_id):
+              """
+              Validate if the SNS topic exists
+              """
+              try:
+                  sns = session.client('sns', region_name=region)
+                  topic_arn = f'arn:aws:sns:{region}:{account_id}:aws-controltower-SecurityNotifications'
+                  sns.get_topic_attributes(TopicArn=topic_arn)
+                  return True, topic_arn
+              except botocore.exceptions.ClientError as e:
+                  return False, f"Error validating SNS topic: {str(e)}"
+
+          def assume_role(account_id, role='AWSControlTowerExecution'):
+              """
+              Assume role in target account
+              """
+              try:
+                  sts = boto3.client('sts')
+                  curr_account = sts.get_caller_identity()['Account']
+                  if curr_account != account_id:
+                      part = sts.get_caller_identity()['Arn'].split(":")[1]
+                      role_arn = f'arn:{part}:iam::{account_id}:role/{role}'
+                      ses_name = f'{account_id}-{role}'
+                      response = sts.assume_role(RoleArn=role_arn, RoleSessionName=ses_name)
+                      return boto3.Session(
+                          aws_access_key_id=response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                          aws_session_token=response['Credentials']['SessionToken'])
+              except botocore.exceptions.ClientError as exe:
+                  logger.error('Unable to assume role', exc_info=True)
+                  raise exe
+
+          def update_sns_topic(session, region, account_id, kms_arn):
+              """
+              Update SNS topic with KMS encryption
+              """
+              logger.info(f'update_sns_topic called with kms_arn: "{kms_arn}" (type: {type(kms_arn)})')
+              config = Config(retries=dict(max_attempts=10))
+              sns = session.client('sns', region_name=region, config=config)
+              sns_topic_arn = f'arn:aws:sns:{region}:{account_id}:aws-controltower-SecurityNotifications'
+              
+              logger.info(f'Setting KmsMasterKeyId to: "{kms_arn}" for topic: {sns_topic_arn}')
+              sns.set_topic_attributes(
+                  TopicArn=sns_topic_arn,
+                  AttributeName='KmsMasterKeyId',
+                  AttributeValue=kms_arn
+              )
+              logger.info(f'Successfully set KmsMasterKeyId to: "{kms_arn}"')
+              return sns_topic_arn
+
+          def remove_sns_encryption(session, region, account_id):
+              """
+              Remove KMS encryption from SNS topic by setting KmsMasterKeyId to empty
+              """
+              try:
+                  config = Config(retries=dict(max_attempts=10))
+                  sns = session.client('sns', region_name=region, config=config)
+                  sns_topic_arn = f'arn:aws:sns:{region}:{account_id}:aws-controltower-SecurityNotifications'
+                  
+                  logger.info(f'Removing KMS encryption from topic: {sns_topic_arn}')
+                  sns.set_topic_attributes(
+                      TopicArn=sns_topic_arn,
+                      AttributeName='KmsMasterKeyId',
+                      AttributeValue=''
+                  )
+                  return True, sns_topic_arn
+              except Exception as e:
+                  return False, str(e)
+
+          def get_accounts_to_update(new_kms_arns, old_kms_arns=None):
+              """
+              Determine which accounts need updates or removals
+              """
+              new_accounts = {}
+              old_accounts = {}
+              
+              # Parse new KMS ARNs
+              for arn in new_kms_arns:
+                  if arn.strip():
+                      details = parse_kms_arn(arn)
+                      key = (details['account_id'], details['region'])
+                      new_accounts[key] = details
+              
+              # Parse old KMS ARNs if provided
+              if old_kms_arns:
+                  for arn in old_kms_arns:
+                      if arn.strip():
+                          details = parse_kms_arn(arn)
+                          key = (details['account_id'], details['region'])
+                          old_accounts[key] = details
+              
+              # Accounts to add/update KMS
+              accounts_to_update = list(new_accounts.values())
+              
+              # Accounts to remove KMS (in old but not in new)
+              accounts_to_remove = []
+              for key, details in old_accounts.items():
+                  if key not in new_accounts:
+                      accounts_to_remove.append({
+                          'account_id': details['account_id'],
+                          'region': details['region']
+                      })
+              
+              return accounts_to_update, accounts_to_remove
+
+          def lambda_handler(event, context):
+              response_data = {}
+              
+              try:
+                  logger.info(f'Event: {event}')
+                  
+                  if 'ResourceProperties' not in event:
+                      raise ValueError("Missing ResourceProperties in event")
+                  
+                  # Get new KMS ARNs
+                  new_kms_arns = [arn.strip() for arn in event['ResourceProperties']['KMSKeyId'].split(',') if arn.strip()]
+                  
+                  # Get old KMS ARNs for updates
+                  old_kms_arns = []
+                  if event['RequestType'] == 'Update' and 'OldResourceProperties' in event:
+                      old_kms_arns = [arn.strip() for arn in event['OldResourceProperties']['KMSKeyId'].split(',') if arn.strip()]
+                  elif event['RequestType'] == 'Delete' and 'OldResourceProperties' in event:
+                      old_kms_arns = [arn.strip() for arn in event['OldResourceProperties']['KMSKeyId'].split(',') if arn.strip()]
+                  elif event['RequestType'] == 'Delete':
+                      old_kms_arns = new_kms_arns
+                  
+                  if event['RequestType'] == 'Delete':
+                      # For delete, remove KMS from all accounts
+                      accounts_to_remove = get_unique_accounts(old_kms_arns)
+                      accounts_to_update = []
+                  else:
+                      # For create/update, determine what needs to be updated or removed
+                      accounts_to_update, accounts_to_remove = get_accounts_to_update(new_kms_arns, old_kms_arns)
+                  
+                  success_count = 0
+                  errors = []
+                  processed_topics = []
+                  
+                  # Process accounts that need KMS updates
+                  for details in accounts_to_update:
+                      account_id = details['account_id']
+                      aws_region = details['region']
+                      kms_arn = details['key_id']
+                      
+                      try:
+                          logger.info(f'Updating KMS for account {account_id} in region {aws_region} with key {kms_arn}')
+                          
+                          if not check_account_in_stackset(account_id):
+                              logger.info(f"Skipping account {account_id} - not in Control Tower StackSet")
+                              continue
+                          
+                          sts_session = assume_role(account_id)
+                          
+                          # Validate KMS key
+                          kms_valid, kms_message = validate_kms_key(sts_session, aws_region, kms_arn)
+                          if not kms_valid:
+                              errors.append(f"KMS validation failed for {account_id}: {kms_message}")
+                              continue
+                          
+                          # Validate SNS topic
+                          sns_valid, sns_message = validate_sns_topic(sts_session, aws_region, account_id)
+                          if not sns_valid:
+                              errors.append(f"SNS validation failed for {account_id}: {sns_message}")
+                              continue
+                          
+                          # Update SNS topic
+                          sns_topic_arn = update_sns_topic(sts_session, aws_region, account_id, kms_arn)
+                          processed_topics.append(f"Updated: {sns_topic_arn}")
+                          success_count += 1
+                          
+                      except Exception as e:
+                          errors.append(f"Error updating account {account_id}: {str(e)}")
+                  
+                  # Process accounts that need KMS removal
+                  for details in accounts_to_remove:
+                      account_id = details['account_id']
+                      aws_region = details['region']
+                      
+                      try:
+                          logger.info(f'Removing KMS for account {account_id} in region {aws_region}')
+                          
+                          if not check_account_in_stackset(account_id):
+                              logger.info(f"Skipping account {account_id} - not in Control Tower StackSet")
+                              continue
+                          
+                          sts_session = assume_role(account_id)
+                          
+                          # Remove KMS encryption
+                          success, result = remove_sns_encryption(sts_session, aws_region, account_id)
+                          if success:
+                              processed_topics.append(f"Removed: {result}")
+                              success_count += 1
+                          else:
+                              errors.append(f"Failed to remove KMS for {account_id}: {result}")
+                          
+                      except Exception as e:
+                          errors.append(f"Error removing KMS for account {account_id}: {str(e)}")
+                  
+                  # Prepare response
+                  response_data['SuccessCount'] = success_count
+                  response_data['ProcessedTopics'] = processed_topics
+                  if errors:
+                      response_data['Errors'] = errors
+                  
+                  status = cfnresponse.SUCCESS if success_count > 0 or (len(accounts_to_update) + len(accounts_to_remove)) == 0 else cfnresponse.FAILED
+                  cfnresponse.send(event, context, status, response_data)
+                  
+              except Exception as e:
+                  logger.exception(f'Unexpected error: {str(e)}')
+                  response_data['Error'] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+
+  SNSKMSUpdate:
+    Type: Custom::SNSKMSUpdate
+    Properties:
+      ServiceToken: !GetAtt SNSKMSUpdateFunction.Arn
+      KMSKeyId: !Ref KMSKeyId
+      UpdateToken: !Sub '${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref SNSKMSUpdateFunction
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt SNSKMSUpdateFunction.Arn
